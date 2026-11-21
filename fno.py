@@ -64,6 +64,13 @@ def atm(chain, und, spot, today=None, min_days=0):
         return None
     today = pd.Timestamp(today or pd.Timestamp.now(tz="Asia/Kolkata").date()).normalize()
     exps = sorted(e for e in c.exp.unique() if e >= today + pd.Timedelta(days=min_days))
+    if c.kind.iloc[0] == "OPTSTK":
+        # stocks: nearest MONTHLY expiry = the last listed expiry of each calendar month
+        last = {}
+        for e in exps:
+            last[(e.year, e.month)] = e
+        exps = sorted(last.values())
+    # indices: nearest expiry of any kind, which is the nearest weekly (monthly where no weekly is listed)
     if not exps:
         return None
     sub = c[c.exp == exps[0]]
