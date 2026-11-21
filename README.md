@@ -44,3 +44,9 @@ BANKNIFTY, FINNIFTY and MIDCPNIFTY) uses the **nearest monthly expiry**.
   `ATM strike`, `ATM CE`, `ATM PE`, `Lot` and `Expiry` columns. The chart and live monitor accept index names such as NIFTY.
 - **Alerts:** set `WATCHLIST=FNO_INDEX`, `FNO_STOCKS` or `FNO_ALL`. Each alert line adds the contract, strike, expiry and lot size.
 - Spot is the close of the candle that triggered the signal. Premiums are not shown, and no orders are placed.
+
+## Option contract scan
+At the bottom of the app, pick an F&O underlying to see its **list of open expiries** (weekly or monthly, number of strikes,
+strike range, lot size). Then choose expiries, how many strikes either side of ATM, Call/Put, and timeframes, and scan the
+option contracts themselves. Each row shows Type, Strike, ITM/ATM/OTM, Expiry, Lot and the Up/Down signal per timeframe,
+with a CSV download. Capped at 60 contracts per scan to respect Dhan's rate limit.

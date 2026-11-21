@@ -106,3 +106,43 @@ def describe(a, sig, mode="buy"):
     if a is None or act is None:
         return ""
     return (f"{act}: {a[leg]} | ATM {a['strike']:g} | expiry {a['expiry']:%d-%b-%Y} | lot {a['lot']}")
+
+
+def expiry_table(chain, und, today=None):
+    """Open expiries of an underlying: type (weekly/monthly), number of strikes, strike range."""
+    c = chain[chain.und == und]
+    today = pd.Timestamp(today or pd.Timestamp.now(tz="Asia/Kolkata").date()).normalize()
+    c = c[c.exp >= today]
+    if c.empty:
+        return pd.DataFrame(columns=["Expiry", "Type", "Strikes", "Min strike", "Max strike", "Lot"])
+    month_last = c.groupby(c.exp.dt.to_period("M")).exp.transform("max")
+    rows = []
+    for e, g in c.groupby("exp"):
+        monthly = (month_last[g.index[0]] == e)
+        rows.append({"Expiry": e.date(), "Type": "Monthly" if monthly else "Weekly",
+                     "Strikes": g.strike.nunique(), "Min strike": g.strike.min(), "Max strike": g.strike.max(),
+                     "Lot": int(g.lot.iloc[0]) if pd.notna(g.lot.iloc[0]) else None})
+    return pd.DataFrame(rows)
+
+
+def contracts(chain, und, expiries, spot, n=5, kinds=("CE", "PE")):
+    """Contracts for the given expiries on the ATM strike +/- n listed strikes (CE and/or PE)."""
+    c = chain[(chain.und == und) & chain.exp.isin(pd.to_datetime(list(expiries)))]
+    out = []
+    for e, g in c.groupby("exp"):
+        strikes = sorted(g.strike.unique())
+        if not strikes:
+            continue
+        i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - spot))
+        for j in range(max(0, i - n), min(len(strikes), i + n + 1)):
+            k = strikes[j]
+            for cp in kinds:
+                r = g[(g.strike == k) & (g.cp == cp)]
+                if r.empty:
+                    continue
+                r = r.iloc[0]
+                money = "ATM" if j == i else (("ITM" if k < spot else "OTM") if cp == "CE" else ("ITM" if k > spot else "OTM"))
+                out.append({"Contract": r["name"], "Type": cp, "Strike": float(k), "Moneyness": money,
+                            "Expiry": e.date(), "Lot": int(r.lot) if pd.notna(r.lot) else None,
+                            "seg": (str(r.sid), "NSE_FNO", r.kind)})
+    return pd.DataFrame(out)

@@ -459,3 +459,75 @@ def monitor():
 
 
 monitor()
+
+
+# ---------------------------------------------------------------- option contract scan
+st.divider()
+st.header("Option contracts: expiries, strikes and scan")
+if not (client_id and token):
+    st.info("Enter Dhan credentials to scan option contracts.")
+else:
+    o_chain, o_eq = load_fno_data()
+    o_ids = fno.underlyings(o_chain, o_eq, "all")
+    oc1, oc2 = st.columns([1, 2])
+    o_und = oc1.selectbox("Underlying", list(o_ids), key="o_und")
+    et = fno.expiry_table(o_chain, o_und)
+    oc2.dataframe(et, use_container_width=True, height=180)
+    if et.empty:
+        st.warning("No open expiries found for this underlying.")
+    else:
+        default = et.Expiry.astype(str).tolist()[:1]
+        o_exp = st.multiselect("Expiries to scan", et.Expiry.astype(str).tolist(), default=default)
+        oc3, oc4, oc5 = st.columns(3)
+        o_n = oc3.slider("Strikes either side of ATM", 0, 10, 3)
+        o_kinds = oc4.multiselect("Call / Put", ["CE", "PE"], default=["CE", "PE"])
+        o_tfs = oc5.multiselect("Timeframes", ALL_TFS, default=["5m", "15m", "1H"], key="o_tfs")
+        st.caption("Each contract costs 1 call per timeframe group (1D, 5m/15m/30m/1H, 1m). "
+                   "Option data comes from Dhan's NSE_FNO feed; thinly traded strikes may have gaps.")
+        if st.button("Scan option contracts", disabled=not (o_exp and o_kinds and o_tfs)):
+            sp = get_frames(headers, o_ids[o_und], ["5m"]).get("5m")
+            if sp is None or sp.empty:
+                st.error("Could not get the underlying's spot price from Dhan.")
+            else:
+                spot = float(sp.close.iloc[-1])
+                cdf = fno.contracts(o_chain, o_und, o_exp, spot, o_n, tuple(o_kinds))
+                if len(cdf) > 60:
+                    st.warning(f"{len(cdf)} contracts selected; scanning the first 60 to stay within Dhan's rate limit.")
+                    cdf = cdf.head(60)
+                st.write(f"{o_und} spot (latest 5m close): **{spot:,.2f}**, {len(cdf)} contracts")
+                ERRS.clear()
+                ABORT.clear()
+                THROTTLED["n"] = 0
+                tf_sel = [t for t in ALL_TFS if t in o_tfs]
+                rows, bar = [], st.progress(0.0, text="Scanning contracts...")
+                ex = ThreadPoolExecutor(max_workers=2)
+                try:
+                    futs = {ex.submit(scan_one, headers, r.Contract, r.seg, tf_sel): r for r in cdf.itertuples()}
+                    for i, f in enumerate(as_completed(futs), 1):
+                        r = futs[f]
+                        try:
+                            res_row = f.result()
+                        except Exception:
+                            res_row = {"Symbol": r.Contract}
+                        res_row.update({"Type": r.Type, "Strike": r.Strike, "Moneyness": r.Moneyness,
+                                        "Expiry": r.Expiry, "Lot": r.Lot})
+                        rows.append(res_row)
+                        bar.progress(i / len(futs), text=f"Scanned {i}/{len(futs)}")
+                finally:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                bar.empty()
+                if ABORT.is_set():
+                    st.error("Dhan kept returning 429 (rate limit); scan stopped. Wait a few minutes and retry.")
+                st.session_state["opt_res"] = (pd.DataFrame(rows), tf_sel, dict(ERRS))
+        if "opt_res" in st.session_state:
+            odf, otfs, oerrs = st.session_state["opt_res"]
+            lead = ["Symbol", "Type", "Strike", "Moneyness", "Expiry", "Lot"]
+            odf = odf[lead + [c for c in odf.columns if c not in lead]].sort_values(["Expiry", "Strike", "Type"])
+            if otfs and (odf[otfs] == "n/a").all(axis=None):
+                st.warning("No candle data came back for these contracts.")
+                for k, v in sorted(oerrs.items(), key=lambda kv: -kv[1])[:3]:
+                    st.code(f"{v}x  {k}")
+            st.dataframe(odf.style.map(lambda v: "background-color:#c8f7c5;color:#064" if v in ("Up", "ALL UP")
+                                       else "background-color:#f9c9c9;color:#800" if v in ("Down", "ALL DOWN") else ""),
+                         use_container_width=True, height=420)
+            st.download_button("Download CSV", odf.to_csv(index=False), "option_scan.csv", "text/csv")
