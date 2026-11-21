@@ -37,9 +37,10 @@ def load_fno(master=None):
     d["exp"] = pd.to_datetime(d["SEM_EXPIRY_DATE"], errors="coerce").dt.normalize()
     d["strike"] = pd.to_numeric(d["SEM_STRIKE_PRICE"], errors="coerce")
     d = d.dropna(subset=["und", "exp", "strike"])
+    d["wk"] = d["SEM_EXPIRY_FLAG"].astype(str).str.upper().eq("W") if "SEM_EXPIRY_FLAG" in d.columns else False
     chain = d.rename(columns={"SEM_INSTRUMENT_NAME": "kind", "SEM_SMST_SECURITY_ID": "sid",
                               "SEM_TRADING_SYMBOL": "name", "SEM_LOT_UNITS": "lot",
-                              "SEM_OPTION_TYPE": "cp"})[["und", "kind", "sid", "name", "lot", "exp", "strike", "cp"]]
+                              "SEM_OPTION_TYPE": "cp"})[["und", "kind", "sid", "name", "lot", "exp", "strike", "cp", "wk"]]
     return chain.reset_index(drop=True), eq_ids
 
 
@@ -63,14 +64,17 @@ def atm(chain, und, spot, today=None, min_days=0):
     if c.empty or spot is None or pd.isna(spot):
         return None
     today = pd.Timestamp(today or pd.Timestamp.now(tz="Asia/Kolkata").date()).normalize()
-    exps = sorted(e for e in c.exp.unique() if e >= today + pd.Timedelta(days=min_days))
-    if c.kind.iloc[0] == "OPTSTK":
-        # stocks: nearest MONTHLY expiry = the last listed expiry of each calendar month
+    all_exps = sorted(c.exp.unique())
+    exps = [e for e in all_exps if e >= today + pd.Timedelta(days=min_days)]
+    months = pd.Series(all_exps).dt.to_period("M")
+    # weekly series exists if Dhan flags a weekly expiry or a month has more than one expiry
+    has_weekly = bool(c.wk.any()) or bool(months.duplicated().any())
+    if not has_weekly:
+        # no weekly series (stocks, BANKNIFTY, FINNIFTY, MIDCPNIFTY ...): last expiry of each month
         last = {}
         for e in exps:
             last[(e.year, e.month)] = e
         exps = sorted(last.values())
-    # indices: nearest expiry of any kind, which is the nearest weekly (monthly where no weekly is listed)
     if not exps:
         return None
     sub = c[c.exp == exps[0]]
