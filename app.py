@@ -13,6 +13,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+import fno
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="NSE Close vs Heikin-Ashi Scan", layout="wide")
@@ -86,6 +88,12 @@ def load_master():
     return out.reset_index(drop=True)
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading F&O contracts...")
+def load_fno_data():
+    chain, eq_ids = fno.load_fno()
+    return chain, eq_ids
+
+
 @st.cache_data(ttl=24 * 3600)
 def load_index_symbols(name):
     r = requests.get(NSE_LISTS[name], headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
@@ -141,7 +149,8 @@ def _post(path, body, headers):
 def fetch_raw(headers, sec_id, kind):
     """kind 'D' = daily, '5' = 5-minute, '1' = 1-minute candles."""
     now = datetime.now()
-    base = {"securityId": str(sec_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY"}
+    sid_, seg_, inst_ = fno.seg_of(sec_id)
+    base = {"securityId": sid_, "exchangeSegment": seg_, "instrument": inst_}
     if kind == "D":
         body = {**base, "expiryCode": 0, "oi": False,
                 "fromDate": (now - timedelta(days=150)).strftime("%Y-%m-%d"),
@@ -218,11 +227,19 @@ def signal(df):
     return "Up" if diff > 0 else "Down" if diff < 0 else "Flat"
 
 
-def scan_one(headers, symbol, sec_id, tfs):
+def scan_one(headers, symbol, sec_id, tfs, chain=None, mode="buy"):
     frames = get_frames(headers, sec_id, tfs)
     row = {"Symbol": symbol}
     for tf in tfs:
         row[tf] = signal(frames[tf])
+    if chain is not None:
+        last = next((frames[t] for t in ("1m", "5m", "15m", "30m", "1H", "1D") if frames.get(t) is not None), None)
+        a = fno.atm(chain, symbol, last.close.iloc[-1]) if last is not None and len(last) else None
+        row["ATM strike"] = a["strike"] if a else None
+        row["ATM CE"] = a["ce"] if a else ""
+        row["ATM PE"] = a["pe"] if a else ""
+        row["Lot"] = a["lot"] if a else None
+        row["Expiry"] = f"{a['expiry']:%d-%b-%Y}" if a else ""
     sigs = [row[tf] for tf in tfs]
     row["All TFs"] = "ALL UP" if all(x == "Up" for x in sigs) else "ALL DOWN" if all(x == "Down" for x in sigs) else ""
     return row
@@ -240,11 +257,13 @@ headers = {"access-token": token, "client-id": client_id, "Content-Type": "appli
            "Accept": "application/json"}
 
 with st.sidebar:
-    universe = st.selectbox("Universe", ["Nifty 50", "Nifty 100", "Nifty 500", "All NSE EQ", "Custom"])
+    universe = st.selectbox("Universe", ["Nifty 50", "Nifty 100", "Nifty 500", "All NSE EQ", "F&O indices (ATM CE/PE)",
+                                         "F&O stocks (ATM CE/PE)", "Indices + F&O stocks", "Custom"])
     custom = st.text_area("Custom symbols (comma separated)", "RELIANCE, TCS, INFY") if universe == "Custom" else ""
     limit = st.number_input("Max stocks (0 = no limit)", 0, 3000, 0)
     sel_tfs = st.multiselect("Timeframes", ALL_TFS, default=ALL_TFS)
     st.caption("Each stock needs 1 call for 1D, 1 for 5m/15m/30m/1H, and 1 for 1m. Untick 1m to scan faster.")
+    opt_mode = "buy" if st.radio("Options action", ["Up = BUY CE, Down = BUY PE", "Up = SELL PE, Down = SELL CE"]).startswith("Up = BUY") else "sell"
     workers = st.slider("Parallel workers", 1, 4, 2)
     run = st.button("Run scan", type="primary", disabled=not (client_id and token and sel_tfs))
     st.caption("Dhan allows 5 data requests/sec. Start with Nifty 50/100; all NSE takes hours.")
@@ -262,14 +281,22 @@ with st.sidebar:
 
 if run:
     master = load_master()
-    if universe == "All NSE EQ":
+    chain, ids_map = None, None
+    if universe in ("F&O indices (ATM CE/PE)", "F&O stocks (ATM CE/PE)", "Indices + F&O stocks"):
+        chain, eq_ids = load_fno_data()
+        ids_map = fno.underlyings(chain, eq_ids, {"F&O indices (ATM CE/PE)": "index",
+                                                  "F&O stocks (ATM CE/PE)": "stocks", "Indices + F&O stocks": "all"}[universe])
+        syms = list(ids_map)
+    elif universe == "All NSE EQ":
         syms = master.symbol.tolist()
     elif universe == "Custom":
         syms = [s.strip().upper() for s in custom.split(",") if s.strip()]
     else:
         syms = load_index_symbols(universe)
     m = master.set_index("symbol").security_id
-    syms = [s for s in syms if s in m.index]
+    if ids_map is None:
+        syms = [s for s in syms if s in m.index]
+        ids_map = {s: m[s] for s in syms}
     if limit:
         syms = syms[: int(limit)]
 
@@ -280,7 +307,7 @@ if run:
     rows, bar = [], st.progress(0.0, text="Scanning...")
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
-        futs = [ex.submit(scan_one, headers, s_, m[s_], tfs) for s_ in syms]
+        futs = [ex.submit(scan_one, headers, s_, ids_map[s_], tfs, chain, opt_mode) for s_ in syms]
         for i, f in enumerate(as_completed(futs), 1):
             try:
                 rows.append(f.result())
@@ -346,11 +373,12 @@ st.divider()
 st.header("Charts: regular vs Heikin-Ashi (any stock)")
 master = load_master()
 scanned = st.session_state["res"].Symbol.tolist() if "res" in st.session_state else []
-all_syms = scanned + [s_ for s_ in master.symbol if s_ not in set(scanned)]
+INDEX_SYMS = {n: (i, *fno.IDX) for n, i in fno.INDEX_IDS.items()}
+all_syms = scanned + [n for n in INDEX_SYMS if n not in scanned] + [s_ for s_ in master.symbol if s_ not in set(scanned)]
 k1, k2 = st.columns([2, 1])
 sym = k1.selectbox("Stock", all_syms)
 bars = k2.slider("Candles to show", 30, 200, 100)
-sid = master.set_index("symbol").security_id.get(sym)
+sid = INDEX_SYMS.get(sym) or master.set_index("symbol").security_id.get(sym)
 
 if not (client_id and token):
     st.info("Enter Dhan credentials to load charts.")
@@ -385,7 +413,7 @@ st.header("Live monitor (works only while this page stays open)")
 st.caption("Up = BUY signal, Down = SELL signal, shown when a closed candle flips. For alerts with the "
            "page closed, run alert_worker.py (see README).")
 lm1, lm2, lm3 = st.columns([3, 1, 1])
-mon_syms = lm1.text_input("Symbols (comma separated)", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK")
+mon_syms = lm1.text_input("Symbols (comma separated)", "NIFTY, BANKNIFTY, RELIANCE, TCS, HDFCBANK")
 mon_tf = lm2.selectbox("Timeframe", ["5m", "15m", "30m", "1H", "1D", "1m"], index=1)
 mon_on = lm3.toggle("Monitor on")
 
@@ -401,11 +429,12 @@ def monitor():
     mst = st.session_state.setdefault("mon_state", {})
     mlog = st.session_state.setdefault("mon_log", [])
     ids = load_master().set_index("symbol").security_id
+    chain, _ = load_fno_data()
     rows = []
     for s_ in [x.strip().upper() for x in mon_syms.split(",") if x.strip()]:
-        if s_ not in ids.index:
+        if s_ not in ids.index and s_ not in INDEX_SYMS:
             continue
-        df = drop_forming(get_frames(headers, ids[s_], [mon_tf])[mon_tf], mon_tf)
+        df = drop_forming(get_frames(headers, INDEX_SYMS.get(s_) or ids[s_], [mon_tf])[mon_tf], mon_tf)
         sig = signal(df)
         if sig == "n/a":
             rows.append({"Symbol": s_, "Signal": "n/a", "Candle": ""})
@@ -415,12 +444,14 @@ def monitor():
         prev = mst.get(key)
         if prev and prev["t"] != t and prev["sig"] != sig and sig in ("Up", "Down"):
             action = "BUY" if sig == "Up" else "SELL"
-            msg = f"{action} - {s_} flipped {prev['sig']} -> {sig} on {mon_tf} close"
+            opt = fno.describe(fno.atm(chain, s_, df.close.iloc[-1]), sig, opt_mode)
+            msg = f"{action} - {s_} flipped {prev['sig']} -> {sig} on {mon_tf} close" + (f" | {opt}" if opt else "")
             mlog.insert(0, {"Time": datetime.now().strftime("%H:%M:%S"), "Alert": msg})
             st.toast(msg)
         mst[key] = {"sig": sig, "t": t}
         rows.append({"Symbol": s_, "Signal": {"Up": "Up (BUY)", "Down": "Down (SELL)"}.get(sig, sig),
-                     "Candle": df.index[-1].strftime("%d-%b %H:%M")})
+                     "Candle": df.index[-1].strftime("%d-%b %H:%M"),
+                     "ATM option": fno.describe(fno.atm(chain, s_, df.close.iloc[-1]), sig, opt_mode)})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
     if mlog:
         st.subheader("Alerts this session")

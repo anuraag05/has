@@ -18,6 +18,8 @@ from email.message import EmailMessage
 import pandas as pd
 import requests
 
+import fno
+
 IST = "Asia/Kolkata"
 API = "https://api.dhan.co/v2"
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -45,6 +47,9 @@ env = lambda k, d="": os.environ.get(k, d).strip()  # noqa: E731
 CID, TOKEN = env("DHAN_CLIENT_ID"), env("DHAN_ACCESS_TOKEN")
 TFS = [t for t in (x.strip() for x in env("TIMEFRAMES", "5m,15m,30m,1H,1D").split(",")) if t in ALL_TFS]
 WATCH = env("WATCHLIST", "NIFTY50")
+# FNO_INDEX | FNO_STOCKS | FNO_ALL as WATCHLIST also adds the ATM call/put to every alert
+OPTION_MODE = env("OPTION_MODE", "buy").lower()  # buy: Up=BUY CE, Down=BUY PE | sell: Up=SELL PE, Down=SELL CE
+OPTION_MIN_DAYS = int(env("OPTION_MIN_DAYS", "0") or 0)  # skip expiries closer than this many days
 TRIGGER = env("TRIGGER", "flip").lower()  # flip | up | down | every
 DELAY = int(env("CLOSE_DELAY_SEC", "8") or 8)  # wait after a close so Dhan has the candle
 STATE_FILE = env("STATE_FILE", "state.json")
@@ -148,7 +153,8 @@ def to_df(js):
 
 def fetch_raw(sec_id, kind):
     now = pd.Timestamp.now(tz=IST)
-    base = {"securityId": str(sec_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY"}
+    sid, seg, inst = fno.seg_of(sec_id)
+    base = {"securityId": sid, "exchangeSegment": seg, "instrument": inst}
     if kind == "D":
         body = {**base, "expiryCode": 0, "oi": False,
                 "fromDate": (now - pd.Timedelta(days=120)).strftime("%Y-%m-%d"),
@@ -242,23 +248,46 @@ def should_alert(prev, sig):
 
 
 # ---------------------------------------------------------------- universe
+CHAIN = None
+
+
 def load_watchlist():
+    global CHAIN
     master = pd.read_csv(MASTER_URL, low_memory=False)
-    master = master[(master["SEM_EXM_EXCH_ID"] == "NSE") & (master["SEM_SEGMENT"] == "E")
-                    & (master["SEM_INSTRUMENT_NAME"] == "EQUITY")]
-    if "SEM_SERIES" in master.columns:
-        master = master[master["SEM_SERIES"] == "EQ"]
-    ids = master.drop_duplicates("SEM_TRADING_SYMBOL").set_index("SEM_TRADING_SYMBOL")["SEM_SMST_SECURITY_ID"]
-    if WATCH.upper() in NSE_LISTS:
-        r = requests.get(NSE_LISTS[WATCH.upper()], headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    CHAIN, eq_ids = fno.load_fno(master)
+    log(f"Option chain loaded: {CHAIN.und.nunique()} underlyings, {len(CHAIN)} contracts")
+    key = WATCH.upper()
+    if key in ("FNO_INDEX", "FNO_STOCKS", "FNO_ALL"):
+        out = fno.underlyings(CHAIN, eq_ids, {"FNO_INDEX": "index", "FNO_STOCKS": "stocks", "FNO_ALL": "all"}[key])
+        if not out:
+            sys.exit("No F&O underlyings found in the Dhan master. Run python alert_worker.py --test.")
+        return out
+    if key in NSE_LISTS:
+        r = requests.get(NSE_LISTS[key], headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
         syms = pd.read_csv(io.StringIO(r.text))["Symbol"].str.strip().tolist()
     else:
-        syms = [s.strip().upper() for s in WATCH.split(",") if s.strip()]
-    missing = [s for s in syms if s not in ids.index]
+        syms = [x.strip().upper() for x in WATCH.split(",") if x.strip()]
+    idx = fno.underlyings(CHAIN, eq_ids, "index")
+    out, missing = {}, []
+    for x in syms:
+        if x in idx:
+            out[x] = idx[x]
+        elif x in eq_ids:
+            out[x] = (eq_ids[x], *fno.EQ)
+        else:
+            missing.append(x)
     if missing:
-        log(f"Not found on Dhan NSE EQ, skipped: {', '.join(missing)}")
-    return {s: ids[s] for s in syms if s in ids.index}
+        log(f"Not found on Dhan NSE, skipped: {', '.join(missing)}")
+    return out
+
+
+def option_line(sym, spot, sig):
+    """ATM contract line for an alert, only for F&O underlyings."""
+    if CHAIN is None:
+        return ""
+    a = fno.atm(CHAIN, sym, spot, min_days=OPTION_MIN_DAYS)
+    return ("\n   -> " + fno.describe(a, sig, OPTION_MODE)) if a else ""
 
 
 def load_state():
@@ -283,7 +312,8 @@ def run():
         sys.exit("TIMEFRAMES has no valid entries. Use any of: " + ", ".join(ALL_TFS))
     watch = load_watchlist()
     state, done, todo = load_state(), {}, {}
-    notify(f"Alert worker started: {len(watch)} stocks, timeframes {', '.join(TFS)}, trigger '{TRIGGER}'.")
+    n_fno = sum(1 for x in watch if x in set(CHAIN.und))
+    notify(f"Alert worker started: {len(watch)} symbols ({n_fno} with ATM options), timeframes {', '.join(TFS)}, trigger '{TRIGGER}'.")
 
     while True:
         now = pd.Timestamp.now(tz=IST)
@@ -314,7 +344,7 @@ def run():
                     prev = state.get(key, {}).get("sig")
                     if should_alert(prev, sig):
                         alerts[tf][sig].append(f"{sym}: close {c:.2f} {'>' if sig == 'Up' else '<'} HA {h:.2f}"
-                                               f" (was {prev or 'n/a'})")
+                                               f" (was {prev or 'n/a'})" + option_line(sym, c, sig))
                     state[key] = {"sig": sig, "t": todo[tf]["b"].isoformat()}
             save_state(state)
 
@@ -335,6 +365,12 @@ def self_test():
     notify("Test alert from alert_worker.py: notifications are working.")
     watch = load_watchlist()
     sym, sid = next(iter(watch.items()))
+    for u in [x for x in ("NIFTY", "BANKNIFTY") if x in watch][:1] + list(watch)[:1]:
+        spot = 24000.0 if u in ("NIFTY", "BANKNIFTY") else 1000.0
+        df0 = fetch_raw(watch[u], "D")
+        spot = float(df0.close.iloc[-1]) if df0 is not None else spot
+        for sg in ("Up", "Down"):
+            log(f"{u} spot {spot:.2f} {sg}: {option_line(u, spot, sg).strip() or 'no option chain'}")
     now = pd.Timestamp.now(tz=IST)
     df = fetch_raw(sid, "D")
     log(f"Dhan daily fetch for {sym}: {'OK, ' + str(len(df)) + ' candles' if df is not None else 'FAILED'}")

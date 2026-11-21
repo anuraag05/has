@@ -33,3 +33,12 @@ command `python alert_worker.py`, set the same values as environment variables).
 Cloud and GitHub Actions cannot do exact close-time alerts. Update `DHAN_ACCESS_TOKEN` when it
 expires; the worker sends you a warning when Dhan rejects the token.
 The Streamlit page also has a **Live monitor** that alerts only while the page is open.
+
+## ATM call and put (index and F&O stocks)
+For NSE indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) and F&O stocks, every signal also names the
+**ATM contract**: the strike closest to the spot price in the nearest open expiry.
+- **Up** -> **BUY CALL (CE)**, **Down** -> **BUY PUT (PE)** (set `OPTION_MODE=sell` for Up -> SELL PUT, Down -> SELL CALL).
+- **App:** pick *F&O indices*, *F&O stocks* or *Indices + F&O stocks* as the universe. The table gets
+  `ATM strike`, `ATM CE`, `ATM PE`, `Lot` and `Expiry` columns. The chart and live monitor accept index names such as NIFTY.
+- **Alerts:** set `WATCHLIST=FNO_INDEX`, `FNO_STOCKS` or `FNO_ALL`. Each alert line adds the contract, strike, expiry and lot size.
+- Spot is the close of the candle that triggered the signal. Premiums are not shown, and no orders are placed.
