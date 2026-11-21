@@ -67,8 +67,9 @@ def atm(chain, und, spot, today=None, min_days=0):
     all_exps = sorted(c.exp.unique())
     exps = [e for e in all_exps if e >= today + pd.Timedelta(days=min_days)]
     months = pd.Series(all_exps).dt.to_period("M")
-    # weekly series exists if Dhan flags a weekly expiry or a month has more than one expiry
-    has_weekly = bool(c.wk.any()) or bool(months.duplicated().any())
+    # an index has a weekly series if Dhan flags a weekly expiry or a month has more than one expiry
+    # stock options never have weeklies, so they always take the monthly path
+    has_weekly = c.kind.iloc[0] == "OPTIDX" and (bool(c.wk.any()) or bool(months.duplicated().any()))
     if not has_weekly:
         # no weekly series (stocks, BANKNIFTY, FINNIFTY, MIDCPNIFTY ...): last expiry of each month
         last = {}

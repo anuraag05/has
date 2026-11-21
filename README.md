@@ -36,7 +36,9 @@ The Streamlit page also has a **Live monitor** that alerts only while the page i
 
 ## ATM call and put (index and F&O stocks)
 For NSE indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) and F&O stocks, every signal also names the
-**ATM contract**: the strike closest to the spot price in the nearest open expiry.
+**ATM contract**: the strike closest to the spot price.
+Underlyings with a **weekly** series use the **nearest weekly expiry**; every underlying without one (all F&O stocks and, today,
+BANKNIFTY, FINNIFTY and MIDCPNIFTY) uses the **nearest monthly expiry**.
 - **Up** -> **BUY CALL (CE)**, **Down** -> **BUY PUT (PE)** (set `OPTION_MODE=sell` for Up -> SELL PUT, Down -> SELL CALL).
 - **App:** pick *F&O indices*, *F&O stocks* or *Indices + F&O stocks* as the universe. The table gets
   `ATM strike`, `ATM CE`, `ATM PE`, `Lot` and `Expiry` columns. The chart and live monitor accept index names such as NIFTY.
